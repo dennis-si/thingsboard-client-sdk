@@ -278,7 +278,10 @@ void Espressif_MQTT_Client::mqtt_event_handler(void *handler_args, esp_event_bas
             }
 
             if (m_received_data_callback != nullptr) {
-                m_received_data_callback(event->topic, reinterpret_cast<uint8_t*>(event->data), event->data_len);
+                char topic[event->topic_len]; //edited by DD
+                memcpy(topic, event->topic, event->topic_len); //edited by DD
+                
+                m_received_data_callback(topic/*event->topic*/, reinterpret_cast<uint8_t*>(event->data), event->data_len); // edited by DD
             }
             break;
         case esp_mqtt_event_id_t::MQTT_EVENT_ERROR:

@@ -1,6 +1,8 @@
 #ifndef Configuration_h
 #define Configuration_h
 
+#define THINGSBOARD_ENABLE_SWOTA 1
+
 // Include sdkconfig file it it exists to allow overwriting of some defines with the configuration entered in the Espressif IDF menuconfig.
 // Only available when compiling for Espressif IDF, but allows to more easily change some configurations with a GUI instead of code.
 #  ifdef __has_include

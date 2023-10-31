@@ -19,11 +19,14 @@ set(srcs
     src/Shared_Attribute_Callback.cpp
     src/Telemetry.cpp
     src/ThingsBoardDefaultLogger.cpp
+    src/SWOTA_Update_Callback.cpp
+    src/SWOTA_Updater.cpp
 )
 
 set(dependencies
     mqtt
     mbedtls
+    spiffs
 )
 
 set(private_dependencies

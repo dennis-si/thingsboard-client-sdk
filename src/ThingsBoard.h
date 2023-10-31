@@ -13,6 +13,7 @@
 #include "Provision_Callback.h"
 #include "OTA_Handler.h"
 #include "IMQTT_Client.h"
+#include "SWOTA_Handler.h"
 
 // Library includes.
 #if THINGSBOARD_ENABLE_STREAM_UTILS
@@ -288,12 +289,34 @@ constexpr char RESETTING_FAILED[] = "Preparing for OTA firmware updates failed, 
 #if THINGSBOARD_ENABLE_DEBUG
 constexpr char PAGE_BREAK[] = "=================================";
 constexpr char NEW_FW[] = "A new Firmware is available:";
+constexpr char NEW_SW[] = "A new Software is available:";
 constexpr char FROM_TOO[] = "(%s) => (%s)";
 constexpr char DOWNLOADING_FW[] = "Attempting to download over MQTT...";
+constexpr char DOWNLOADING_SW[] = "Attempting to download over MQTT...";
 #endif // THINGSBOARD_ENABLE_DEBUG
 #endif // THINGSBOARD_ENABLE_PROGMEM
 
 #endif // THINGSBOARD_ENABLE_OTA
+
+#if THINGSBOARD_ENABLE_SWOTA
+constexpr char SOFTWARE_RESPONSE_TOPIC[] = "v2/sw/response/0/chunk";
+constexpr char SOFTWARE_RESPONSE_SUBSCRIBE_TOPIC[] = "v2/sw/response/#";
+constexpr char SOFTWARE_REQUEST_TOPIC[] = "v2/sw/request/0/chunk/%u";
+constexpr char CURR_SW_TITLE_KEY[] = "current_sw_title";
+constexpr char CURR_SW_VER_KEY[] = "current_sw_version";
+constexpr char SW_ERROR_KEY[] = "sw_error";
+constexpr char SW_STATE_KEY[] = "sw_state";
+constexpr char SW_VER_KEY[] = "sw_version";
+constexpr char SW_TITLE_KEY[] = "sw_title";
+constexpr char SW_CHKS_KEY[] = "sw_checksum";
+constexpr char SW_CHKS_ALGO_KEY[] = "sw_checksum_algorithm";
+constexpr char SW_SIZE_KEY[] = "sw_size";
+constexpr char NO_SW[] = "No new software assigned on the given device";
+constexpr char EMPTY_SW[] = "Given software was NULL";
+constexpr char SW_UP_TO_DATE[] = "Software is already up to date";
+constexpr char SW_NOT_FOR_US[] = "Software is not for us (title is different)";
+constexpr char SW_CHKS_ALGO_NOT_SUPPORTED[] = "Checksum algorithm (%s) is not supported";
+#endif // THINGSBOARD_ENABLE_SWOTA
 
 
 #if THINGSBOARD_ENABLE_DYNAMIC
@@ -347,6 +370,12 @@ class ThingsBoardSized {
       , m_change_buffer_size(false)
       , m_ota(std::bind(&ThingsBoardSized::Publish_Chunk_Request, this, std::placeholders::_1), std::bind(&ThingsBoardSized::Firmware_Send_State, this, std::placeholders::_1, std::placeholders::_2), std::bind(&ThingsBoardSized::Firmware_OTA_Unsubscribe, this))
 #endif // THINGSBOARD_ENABLE_OTA
+#if THINGSBOARD_ENABLE_SWOTA
+      , m_sw_callback(nullptr) // edit by DD
+      //, m_previous_buffer_size(0U)
+      //, m_change_buffer_size(false)
+      , m_swOta(std::bind(&ThingsBoardSized::SwPublish_Chunk_Request, this, std::placeholders::_1), std::bind(&ThingsBoardSized::Software_Send_State, this, std::placeholders::_1, std::placeholders::_2), std::bind(&ThingsBoardSized::Software_OTA_Unsubscribe, this)) // edit by DD
+#endif // THINGSBOARD_ENABLE_SWOTA
     {
       setBufferSize(bufferSize);
 
@@ -434,6 +463,9 @@ class ThingsBoardSized {
       // as well as all firmware subscriptions
       // and inform the user of the failed firmware update
       this->Stop_Firmware_Update();
+#if THINGSBOARD_ENABLE_SWOTA
+      this->Stop_Software_Update();
+#endif //THINGSBOARD_ENABLE_SWOTA
     }
 
     /// @brief Connects to the specified ThingsBoard server over the given port as the given device
@@ -1086,6 +1118,87 @@ class ThingsBoardSized {
       m_shared_attribute_update_callbacks.clear();
       return m_client.unsubscribe(ATTRIBUTE_TOPIC);
     }
+
+
+   //----------------------------------------------------------------------------
+    // Software OTA API
+
+#if THINGSBOARD_ENABLE_SWOTA
+
+    /// @brief Immediately starts a software update if software is assigned to the given device.
+    /// See https://thingsboard.io/docs/user-guide/ota-updates/ for more information
+    /// @param callback Callback method that will be called
+    /// @return Whether subscribing the given callback was successful or not
+    inline bool Start_Software_Update(const SWOTA_Update_Callback& callback) { //edit by DD
+      if (!Prepare_Software_Settings(callback))  {
+        Logger::log(RESETTING_FAILED);
+        return false;
+      }
+
+      // Request the software information
+      const std::vector<const char *> sw_shared_keys{SW_CHKS_KEY, SW_CHKS_ALGO_KEY, SW_SIZE_KEY, SW_TITLE_KEY, SW_VER_KEY};
+      const Attribute_Request_Callback sw_request_callback(std::bind(&ThingsBoardSized::Software_Shared_Attribute_Received, this, std::placeholders::_1), sw_shared_keys.cbegin(), sw_shared_keys.cend());
+      return Shared_Attributes_Request(sw_request_callback);
+    }
+
+    /// @brief Stops the currently running software update, calls the finish callback with a failure if the update is running.
+    /// See https://thingsboard.io/docs/user-guide/ota-updates/ for more information
+    inline void Stop_Software_Update() {
+      m_swOta.Stop_Software_Update();
+    }
+
+    /// @brief Subscribes for any assignment of software to the given device device,
+    /// which will then start a software update.
+    /// See https://thingsboard.io/docs/user-guide/ota-updates/ for more information
+    /// @param callback Callback method that will be called
+    /// @return Whether subscribing the given callback was successful or not
+    inline bool Subscribe_Software_Update(const SWOTA_Update_Callback& callback) {
+      if (!Prepare_Software_Settings(callback))  {
+        Logger::log(RESETTING_FAILED);
+        return false;
+      }
+
+      // Subscribes to changes of the software information
+      const std::vector<const char *> sw_shared_keys{SW_CHKS_KEY, SW_CHKS_ALGO_KEY, SW_SIZE_KEY, SW_TITLE_KEY, SW_VER_KEY};
+      const Shared_Attribute_Callback sw_update_callback(std::bind(&ThingsBoardSized::Software_Shared_Attribute_Received, this, std::placeholders::_1), sw_shared_keys.cbegin(), sw_shared_keys.cend());
+      return Shared_Attributes_Subscribe(sw_update_callback);
+    }
+
+    /// @brief Sends the given software title and software version to the cloud.
+    /// See https://thingsboard.io/docs/user-guide/ota-updates/ for more information
+    /// @param currSwTitle Current device software title
+    /// @param currSwVersion Current device software version
+    /// @return Whether sending the current device software information was successful or not
+    inline bool Software_Send_Info(const char *currSwTitle, const char *currSwVersion) {
+      StaticJsonDocument<JSON_OBJECT_SIZE(2)> currentSoftwareInfo;
+      const JsonObject currentSoftwareInfoObject = currentSoftwareInfo.to<JsonObject>();
+
+      currentSoftwareInfoObject[CURR_SW_TITLE_KEY] = currSwTitle;
+      currentSoftwareInfoObject[CURR_SW_VER_KEY] = currSwVersion;
+      return sendTelemetryJson(currentSoftwareInfoObject, Helper::Measure_Json(currentSoftwareInfoObject));
+    }
+
+    /// @brief Sends the given software state to the cloud.
+    /// See https://thingsboard.io/docs/user-guide/ota-updates/ for more information
+    /// @param currSwState Current software download state
+    /// @param swError Software error message that describes the current software state,
+    /// pass nullptr or an empty string if the current state is not a failure state
+    /// and therefore does not require any software error messsages
+    /// @return Whether sending the current software download state was successful or not
+    inline bool Software_Send_State(const char *currSwState, const char* swError = nullptr) {
+      StaticJsonDocument<JSON_OBJECT_SIZE(2)> currentSoftwareState;
+      const JsonObject currentSoftwareStateObject = currentSoftwareState.to<JsonObject>();
+
+      // Make the sw error optional,
+      // meaning if it is an empty string or null instead we don't send it at all.
+      if (swError != nullptr && swError[0] != '\0') {
+        currentSoftwareStateObject[SW_ERROR_KEY] = swError;
+      }
+      currentSoftwareStateObject[SW_STATE_KEY] = currSwState;
+      return sendTelemetryJson(currentSoftwareStateObject, Helper::Measure_Json(currentSoftwareStateObject));
+    }
+
+#endif // THINGSBOARD_ENABLE_SWOTA
   
   private:
 
@@ -1345,12 +1458,14 @@ class ThingsBoardSized {
       // If firmware version and title is the same, we do not initiate an update, because we expect the binary to be the same one we are currently using
       else if (strncmp_P(curr_fw_title, fw_title, JSON_STRING_SIZE(strlen(curr_fw_title))) == 0 && strncmp_P(curr_fw_version, fw_version, JSON_STRING_SIZE(strlen(curr_fw_version))) == 0) {
         Logger::log(FW_UP_TO_DATE);
-        Firmware_Send_State(FW_STATE_FAILED, FW_UP_TO_DATE);
+        Firmware_Send_State(FW_STATE_UPDATED, FW_UP_TO_DATE);
         return;
       }
       // If firmware title is not the same, we do not initiate an update, because we expect the binary to be for another device type 
       else if (strncmp_P(curr_fw_title, fw_title, JSON_STRING_SIZE(strlen(curr_fw_title))) != 0) {
         Logger::log(FW_NOT_FOR_US);
+        ESP_LOGI("extra", "%s (%d)", curr_fw_title, strlen(curr_fw_title)); 
+        ESP_LOGI("extra", "%s (%d)", fw_title, strlen(fw_title)); 
         Firmware_Send_State(FW_STATE_FAILED, FW_NOT_FOR_US);
         return;
       }
@@ -1540,7 +1655,6 @@ class ThingsBoardSized {
         Logger::log(UNABLE_TO_SERIALIZE);
         return false;
       }
-
       return telemetry ? sendTelemetryJson(object, Helper::Measure_Json(object)) : sendAttributeJSON(object, Helper::Measure_Json(object));
     }
 
@@ -1910,6 +2024,216 @@ class ThingsBoardSized {
       return telemetry ? sendTelemetryJson(object, Helper::Measure_Json(object)) : sendAttributeJSON(object, Helper::Measure_Json(object));
     }
 
+#if THINGSBOARD_ENABLE_SWOTA
+
+    /// @brief Publishes a request via MQTT to request the given software chunk
+    /// @param request_chunck Chunk index that should be requested from the server
+    /// @return Whether publishing the message was successful or not
+    inline bool SwPublish_Chunk_Request(const size_t& request_chunck) {
+      // Calculate the number of chuncks we need to request,
+      // in order to download the complete software binary
+      const uint16_t& chunk_size = m_sw_callback->Get_Chunk_Size();
+
+      // Convert the interger size into a readable string
+      char size[Helper::detectSize(NUMBER_PRINTF, chunk_size)];
+      snprintf_P(size, sizeof(size), NUMBER_PRINTF, chunk_size);
+      const size_t jsonSize = strlen(size);
+
+      // Size adjuts dynamically to the current length of the currChunk number to ensure we don't cut it out of the topic string.
+      char topic[Helper::detectSize(SOFTWARE_REQUEST_TOPIC, request_chunck)];
+      snprintf_P(topic, sizeof(topic), SOFTWARE_REQUEST_TOPIC, request_chunck);
+
+      return m_client.publish(topic, reinterpret_cast<uint8_t*>(size), jsonSize);
+    }
+
+    /// @brief Checks the included information in the callback,
+    /// and attempts to sends the current device software information to the cloud
+    /// @param callback Callback method that will be called
+    /// @return Whether checking and sending the current device software information was successful or not
+    inline bool Prepare_Software_Settings(const SWOTA_Update_Callback& callback) {
+      const char *currSwTitle = callback.Get_Software_Title();
+      const char *currSwVersion = callback.Get_Software_Version();
+
+      // Send current software version
+      if (currSwTitle == nullptr || currSwVersion == nullptr) {
+        return false;
+      }
+      else if (!Software_Send_Info(currSwTitle, currSwVersion)) {
+        return false;
+      }
+
+      // Set private members needed for update
+      m_sw_callback = &callback;
+      return true;
+    }
+
+    /// @brief Subscribes to the software response topic
+    /// @return Whether subscribing to the software response topic was successful or not
+    inline bool Software_OTA_Subscribe() {
+      if (!m_client.subscribe(SOFTWARE_RESPONSE_SUBSCRIBE_TOPIC)) {
+        Logger::log(SUBSCRIBE_TOPIC_FAILED);
+        Software_Send_State(SW_STATE_FAILED, SUBSCRIBE_TOPIC_FAILED);
+        return false;
+      }
+      return true;
+    }
+
+    /// @brief Unsubscribes from the software response topic and clears any memory associated with the software update,
+    /// should not be called before actually fully completing the software update.
+    /// @return Whether unsubscribing from the software response topic was successful or not
+    inline bool Software_OTA_Unsubscribe() {
+      // Buffer size has been set to another value before the update,
+      // to allow to receive ota chunck packets that might be much bigger than the normal
+      // buffer size would allow, therefore we return to the previous value to decrease overall memory usage
+      if (m_change_buffer_size) {
+          m_client.set_buffer_size(m_previous_buffer_size);
+      }
+      // Reset now not needed private member variables
+      m_sw_callback = nullptr;
+      // Unsubscribe from the topic
+      return m_client.unsubscribe(SOFTWARE_RESPONSE_SUBSCRIBE_TOPIC);
+    }
+
+    /// @brief Callback that will be called upon software shared attribute arrival
+    /// @param data Json data containing key-value pairs for the needed software information,
+    /// to ensure we have a software assigned and can start the update over MQTT
+    inline void Software_Shared_Attribute_Received(const Shared_Attribute_Data& data) {
+      // Check if software is available for our device
+      if (!data.containsKey(SW_VER_KEY) || !data.containsKey(SW_TITLE_KEY)) {
+        Logger::log(NO_SW);
+        Software_Send_State(SW_STATE_FAILED, NO_SW);
+        return;
+      }
+      else if (m_sw_callback == nullptr) {
+        Logger::log(OTA_CB_IS_NULL);
+        Software_Send_State(SW_STATE_FAILED, OTA_CB_IS_NULL);
+        return;
+      }
+
+      const char *sw_title = data[SW_TITLE_KEY].as<const char *>();
+      const char *sw_version = data[SW_VER_KEY].as<const char *>();
+      const std::string sw_checksum = data[SW_CHKS_KEY].as<std::string>();
+      const std::string sw_algorithm = data[SW_CHKS_ALGO_KEY].as<std::string>();
+      const size_t sw_size = data[SW_SIZE_KEY].as<const size_t>();
+
+      const char *curr_sw_title = m_sw_callback->Get_Software_Title();
+      const char *curr_sw_version = m_sw_callback->Get_Software_Version();
+
+      if (sw_title == nullptr || sw_version == nullptr || curr_sw_title == nullptr || curr_sw_version == nullptr || sw_algorithm.empty() || sw_checksum.empty()) {
+        Logger::log(EMPTY_SW);
+        Software_Send_State(SW_STATE_FAILED, EMPTY_SW);
+        return;
+      }
+      // If software version and title is the same, we do not initiate an update, because we expect the binary to be the same one we are currently using
+      else if (strncmp_P(curr_sw_title, sw_title, JSON_STRING_SIZE(strlen(curr_sw_title))) == 0 && strncmp_P(curr_sw_version, sw_version, JSON_STRING_SIZE(strlen(curr_sw_version))) == 0) {
+        Logger::log(SW_UP_TO_DATE);
+        Software_Send_State(SW_STATE_UPDATED, SW_UP_TO_DATE);
+        return;
+      }
+      // If software title is not the same, we do not initiate an update, because we expect the binary to be for another device type 
+      else if (strncmp_P(curr_sw_title, sw_title, JSON_STRING_SIZE(strlen(curr_sw_title))) != 0) {
+        Logger::log(SW_NOT_FOR_US);
+        ESP_LOGI("extra", "%s (%d)", curr_sw_title, strlen(curr_sw_title)); 
+        ESP_LOGI("extra", "%s (%d)", sw_title, strlen(sw_title)); 
+        Software_Send_State(SW_STATE_FAILED, SW_NOT_FOR_US);
+        return;
+      }
+
+      mbedtls_md_type_t sw_checksum_algorithm = mbedtls_md_type_t();
+
+      // Change the used software algorithm, depending on which type is set for the given software information
+      if (sw_algorithm.compare(CHECKSUM_AGORITM_MD5) == 0) {
+        sw_checksum_algorithm = mbedtls_md_type_t::MBEDTLS_MD_MD5;
+      }
+      else if (sw_algorithm.compare(CHECKSUM_AGORITM_SHA256) == 0) {
+        sw_checksum_algorithm = mbedtls_md_type_t::MBEDTLS_MD_SHA256;
+      }
+      else if (sw_algorithm.compare(CHECKSUM_AGORITM_SHA384) == 0) {
+        sw_checksum_algorithm = mbedtls_md_type_t::MBEDTLS_MD_SHA384;
+      }
+      else if (sw_algorithm.compare(CHECKSUM_AGORITM_SHA512) == 0) {
+        sw_checksum_algorithm = mbedtls_md_type_t::MBEDTLS_MD_SHA512;
+      }
+      else {
+        char message[JSON_STRING_SIZE(strlen(SW_CHKS_ALGO_NOT_SUPPORTED)) + JSON_STRING_SIZE(sw_algorithm.size())];
+        snprintf_P(message, sizeof(message), SW_CHKS_ALGO_NOT_SUPPORTED, sw_algorithm.c_str());
+        Logger::log(message);
+        Software_Send_State(SW_STATE_FAILED, message);
+        return;
+      }
+
+      if (!Software_OTA_Subscribe()) {
+        return;
+      }
+
+#if THINGSBOARD_ENABLE_DEBUG
+      Logger::log(PAGE_BREAK);
+      Logger::log(NEW_SW);
+      char software[JSON_STRING_SIZE(strlen(FROM_TOO)) + JSON_STRING_SIZE(strlen(curr_sw_version)) + JSON_STRING_SIZE(strlen(sw_version))];
+      snprintf_P(software, sizeof(software), FROM_TOO, curr_sw_version, sw_version);
+      Logger::log(software);
+      Logger::log(DOWNLOADING_SW);
+#endif // THINGSBOARD_ENABLE_DEBUG
+
+      // Calculate the number of chuncks we need to request,
+      // in order to download the complete software binary
+      const uint16_t& chunk_size = m_sw_callback->Get_Chunk_Size();
+
+      // Get the previous buffer size and cache it so the previous settings can be restored.
+      m_previous_buffer_size = m_client.get_buffer_size();
+      m_change_buffer_size = m_previous_buffer_size < (chunk_size + 50U);
+
+      // Increase size of receive buffer
+      if (m_change_buffer_size && !m_client.set_buffer_size(chunk_size + 50U)) {
+        Logger::log(NOT_ENOUGH_RAM);
+        Software_Send_State(SW_STATE_FAILED, NOT_ENOUGH_RAM);
+        return;
+      }
+
+      m_swOta.Start_Software_Update(m_sw_callback, sw_size, sw_algorithm, sw_checksum, sw_checksum_algorithm);
+    }
+
+    /// @brief Process callback that will be called upon software response arrival
+    /// and is responsible for handling the payload and calling the appropriate previously subscribed callback
+    /// @param topic Previously subscribed topic, we got the response over
+    /// @param payload Payload that was sent over the cloud and received over the given topic
+    /// @param length Total length of the received payload
+    inline void process_software_response(char *topic, uint8_t *payload, const size_t& length) {
+      // Remove the not needed part of the received topic string, which is everything before the request id,
+      // therefore we remove the section before that which is the topic + an additional "/" character, that seperates the topic from the request id.
+      // Meaning the index we want to get the substring from is the length of the topic + 1 for the additonal "/" character
+      const size_t index = strlen(SOFTWARE_RESPONSE_TOPIC) + 1U;
+#if THINGSBOARD_ENABLE_STL
+      std::string request = topic;
+      request = request.substr(index, request.length() - index);
+#else
+      String request = topic;
+      request = request.substring(index);
+#endif // THINGSBOARD_ENABLE_STL
+
+      // Convert the remaining text after the topic to an integer, because it should now contain only the request id
+      const size_t request_id = atoi(request.c_str());
+
+      // Check if the remaining stack size of the current task would overflow the stack,
+      // if it would allocate the memory on the heap instead to ensure no stack overflow occurs.
+      if (getMaximumStackSize() < length) {
+        uint8_t* binary = new uint8_t[length];
+        memcpy(binary, payload, length);
+        m_swOta.Process_Software_Packet(request_id, binary, length);
+        // Ensure to actually delete the memory placed onto the heap, to make sure we do not create a memory leak
+        // and set the pointer to null so we do not have a dangling reference.
+        delete[] binary;
+        binary = nullptr;
+      }
+      else {
+        uint8_t binary[length];
+        memcpy(binary, payload, length);
+        m_swOta.Process_Software_Packet(request_id, binary, length);
+      }
+    }
+
+#endif // THINGSBOARD_ENABLE_SWOTA
+
     /// @brief Vector signature
 #if THINGSBOARD_ENABLE_STL
     template<typename T>
@@ -1943,6 +2267,13 @@ class ThingsBoardSized {
     OTA_Handler<Logger> m_ota; // Class instance that handles the flashing and creating a hash from the given received binary firmware data
 #endif // THINGSBOARD_ENABLE_OTA
 
+#if THINGSBOARD_ENABLE_SWOTA
+    const SWOTA_Update_Callback *m_sw_callback; // Ota update response callback
+    //uint16_t m_previous_buffer_size; // Previous buffer size of the underlying client, used to revert to the previously configured buffer size if it was temporarily increased by the OTA update
+    //bool m_change_buffer_size; // Whether the buffer size had to be changed, because the previous internal buffer size was to small to hold the software chunks
+    SWOTA_Handler<Logger> m_swOta; // Class instance that handles the flashing and creating a hash from the given received binary software data
+#endif // THINGSBOARD_ENABLE_SWOTA
+
     /// @brief MQTT callback that will be called if a publish message is received from the server
     /// @param topic Previously subscribed topic, we got the response over 
     /// @param payload Payload that was sent over the cloud and received over the given topic
@@ -1963,11 +2294,23 @@ class ThingsBoardSized {
       }
 #endif // THINGSBOARD_ENABLE_OTA
 
+#if THINGSBOARD_ENABLE_SWOTA
+      // When receiving the ota binary payload we do not want to deserialize it into json, because it only contains
+      // software bytes that should be directly writtin into flash, therefore we can skip that step and directly process those bytes
+      if (strncmp_P(SOFTWARE_RESPONSE_TOPIC, topic, strlen(SOFTWARE_RESPONSE_TOPIC)) == 0) {
+        process_software_response(topic, payload, length);
+        return;
+      }
+#endif // THINGSBOARD_ENABLE_SWOTA
+
 #if THINGSBOARD_ENABLE_DYNAMIC
       // Buffer that we deserialize is writeable and not read only --> zero copy, meaning the size for the data is 0 bytes,
       // Data structure size depends on the amount of key value pairs received.
       // See https://arduinojson.org/v6/assistant/ for more information on the needed size for the JsonDocument
       const size_t dataStructureMemoryUsage = JSON_OBJECT_SIZE(Helper::getOccurences(reinterpret_cast<char*>(payload), COLON));
+      ESP_LOGI("Thingsb", "size %d", dataStructureMemoryUsage);
+      ESP_LOGI("Thingsb", "free heap: %d",(int)esp_get_free_heap_size());
+      //ESP_LOGI("Thingsb", "Payload %s", payload);
       TBJsonDocument jsonBuffer(dataStructureMemoryUsage);
 #else
       StaticJsonDocument<JSON_OBJECT_SIZE(MaxFieldsAmt)> jsonBuffer;
